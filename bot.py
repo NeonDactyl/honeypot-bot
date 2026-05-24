@@ -103,6 +103,13 @@ async def on_message(message: discord.Message):
         log.error("Failed to ban %s: %s", user, exc)
         return
 
+    bans_channel = discord.utils.get(guild.text_channels, name="bans")
+    if bans_channel:
+        try:
+            await bans_channel.send(f"{user.name} ({user.id}) - {HONEYPOT_CHANNEL_NAME}")
+        except discord.HTTPException as exc:
+            log.error("Failed to log to #bans in guild '%s': %s", guild.name, exc)
+
     # Brief pause so the ban audit log entry is written before unban
     await asyncio.sleep(2)
 
