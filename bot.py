@@ -106,7 +106,7 @@ async def on_message(message: discord.Message):
     bans_channel = discord.utils.get(guild.text_channels, name="bans")
     if bans_channel:
         try:
-            content_preview = f'\n> {message.content}' if message.content else ""
+            content_preview = f'\n> {message.content}' if message.content else "(no text)"
             await bans_channel.send(f"{user.name} ({user.id}) - {HONEYPOT_CHANNEL_NAME}{content_preview}")
         except discord.HTTPException as exc:
             log.error("Failed to log to #bans in guild '%s': %s", guild.name, exc)
