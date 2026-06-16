@@ -20,9 +20,18 @@ DELETE_MESSAGE_SECONDS = 3600  # delete last 1 hour of messages on ban
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.members = True
 
-bot = discord.Client(intents=intents)
+# max_ratelimit_timeout=None (the default) makes discord.py wait out any HTTP
+# rate limit and retry, rather than raising. We set it explicitly to document
+# that 429s are handled by the SDK; the dedupe below keeps us from generating
+# the request bursts that triggered rate limiting in the first place.
+bot = discord.Client(intents=intents, max_ratelimit_timeout=None)
+
+# Guild+user IDs currently being banned. A compromised account often spams the
+# honeypot channel, and each message arrives as its own on_message event. Without
+# this guard a single spammer triggers N ban/unban cycles back-to-back, which is
+# what got us rate limited by Discord.
+_processing: set[tuple[int, int]] = set()
 
 
 async def ensure_honeypot_channel(guild: discord.Guild) -> discord.TextChannel:
@@ -82,48 +91,57 @@ async def on_message(message: discord.Message):
     guild = message.guild
     user = message.author
 
-    log.warning(
-        "Honeypot triggered by %s (id=%s) in guild '%s'",
-        user,
-        user.id,
-        guild.name,
-    )
+    # Skip if we're already banning this user (e.g. they spammed the channel).
+    key = (guild.id, user.id)
+    if key in _processing:
+        return
+    _processing.add(key)
 
     try:
-        await guild.ban(
+        log.warning(
+            "Honeypot triggered by %s (id=%s) in guild '%s'",
             user,
-            reason="Honeypot channel triggered — possible compromised account",
-            delete_message_seconds=DELETE_MESSAGE_SECONDS,
+            user.id,
+            guild.name,
         )
-        log.info("Banned %s from guild '%s'", user, guild.name)
-    except discord.Forbidden:
-        log.error("Missing ban permission in guild '%s'", guild.name)
-        return
-    except discord.HTTPException as exc:
-        log.error("Failed to ban %s: %s", user, exc)
-        return
 
-    bans_channel = discord.utils.get(guild.text_channels, name="bans")
-    if bans_channel:
         try:
-            content_preview = f'\n> {message.content}' if message.content else "(no text)"
-            await bans_channel.send(f"{user.name} ({user.id}) - {HONEYPOT_CHANNEL_NAME}{content_preview}")
+            await guild.ban(
+                user,
+                reason="Honeypot channel triggered — possible compromised account",
+                delete_message_seconds=DELETE_MESSAGE_SECONDS,
+            )
+            log.info("Banned %s from guild '%s'", user, guild.name)
+        except discord.Forbidden:
+            log.error("Missing ban permission in guild '%s'", guild.name)
+            return
         except discord.HTTPException as exc:
-            log.error("Failed to log to #bans in guild '%s': %s", guild.name, exc)
+            log.error("Failed to ban %s: %s", user, exc)
+            return
 
-    # Brief pause so the ban audit log entry is written before unban
-    await asyncio.sleep(2)
+        bans_channel = discord.utils.get(guild.text_channels, name="bans")
+        if bans_channel:
+            try:
+                content_preview = f'\n> {message.content}' if message.content else "(no text)"
+                await bans_channel.send(f"{user.name} ({user.id}) - {HONEYPOT_CHANNEL_NAME}{content_preview}")
+            except discord.HTTPException as exc:
+                log.error("Failed to log to #bans in guild '%s': %s", guild.name, exc)
 
-    try:
-        await guild.unban(
-            user,
-            reason="Automatic unban after honeypot detection — account may have been compromised",
-        )
-        log.info("Unbanned %s from guild '%s'", user, guild.name)
-    except discord.Forbidden:
-        log.error("Missing unban permission in guild '%s'", guild.name)
-    except discord.HTTPException as exc:
-        log.error("Failed to unban %s: %s", user, exc)
+        # Brief pause so the ban audit log entry is written before unban
+        await asyncio.sleep(2)
+
+        try:
+            await guild.unban(
+                user,
+                reason="Automatic unban after honeypot detection — account may have been compromised",
+            )
+            log.info("Unbanned %s from guild '%s'", user, guild.name)
+        except discord.Forbidden:
+            log.error("Missing unban permission in guild '%s'", guild.name)
+        except discord.HTTPException as exc:
+            log.error("Failed to unban %s: %s", user, exc)
+    finally:
+        _processing.discard(key)
 
 
 token = os.environ.get("DISCORD_TOKEN")
