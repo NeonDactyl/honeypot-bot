@@ -34,12 +34,59 @@ bot = discord.Client(intents=intents, max_ratelimit_timeout=None)
 _processing: set[tuple[int, int]] = set()
 
 
-async def ensure_honeypot_channel(guild: discord.Guild) -> discord.TextChannel:
-    existing = discord.utils.get(guild.text_channels, name=HONEYPOT_CHANNEL_NAME)
-    if existing:
-        return existing
+# Per-guild locks so overlapping on_ready / on_guild_join runs (on_ready fires
+# again on every gateway reconnect) can't both decide to create the channel.
+_setup_locks: dict[int, asyncio.Lock] = {}
 
-    category = discord.utils.get(guild.categories, name=HONEYPOT_CATEGORY_NAME)
+
+async def ensure_honeypot_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    if guild.unavailable:
+        log.warning("Guild %s is unavailable; skipping honeypot setup", guild.id)
+        return None
+
+    lock = _setup_locks.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        return await _ensure_honeypot_channel(guild)
+
+
+async def _ensure_honeypot_channel(guild: discord.Guild) -> discord.TextChannel:
+    # Ask the API rather than trusting the gateway cache, which can be empty or
+    # partial right after a (re)connect — that's how we ended up with duplicates.
+    channels = await guild.fetch_channels()
+
+    # If earlier runs left duplicates behind, keep the oldest (lowest snowflake
+    # ID) and delete the rest.
+    honeypots = sorted(
+        (c for c in channels if c.name == HONEYPOT_CHANNEL_NAME and c.type == discord.ChannelType.text),
+        key=lambda c: c.id,
+    )
+    categories = sorted(
+        (c for c in channels if c.name == HONEYPOT_CATEGORY_NAME and c.type == discord.ChannelType.category),
+        key=lambda c: c.id,
+    )
+
+    for dup in honeypots[1:]:
+        await dup.delete(reason="Duplicate honeypot channel")
+        log.info("Deleted duplicate honeypot channel %s in guild '%s'", dup.id, guild.name)
+
+    removed = {c.id for c in honeypots[1:]}
+    for dup in categories[1:]:
+        # Only remove the category if nothing else lives in it, so we never
+        # orphan channels an admin put there.
+        if any(c.category_id == dup.id and c.id not in removed for c in channels):
+            log.warning(
+                "Duplicate category %s in guild '%s' is not empty; leaving it",
+                dup.id,
+                guild.name,
+            )
+            continue
+        await dup.delete(reason="Duplicate honeypot category")
+        log.info("Deleted duplicate category %s in guild '%s'", dup.id, guild.name)
+
+    if honeypots:
+        return honeypots[0]
+
+    category = categories[0] if categories else None
     if not category:
         category = await guild.create_category(HONEYPOT_CATEGORY_NAME)
         log.info("Created category '%s' in guild '%s'", HONEYPOT_CATEGORY_NAME, guild.name)
